@@ -44,6 +44,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'writethumbnail': True,
         'quiet': True,
         'no_warnings': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'web_creator'],
+            }
+        },
     }
 
     loop = asyncio.get_event_loop()
