@@ -2,6 +2,7 @@ import os
 import glob
 import asyncio
 from pathlib import Path
+from typing import Optional
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -12,7 +13,7 @@ from telegram.request import HTTPXRequest
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "9280771787:AAGKrgffYGOEmHBxR4IF9RZPjj_8D8nyDcc")
 DEFAULT_CHAT_ID = os.environ.get("CHAT_ID", "-5155020880")
 
-# On Vercel serverless, /tmp is writable; otherwise use local temp_downloads
+# On Vercel serverless / Linux containers, /tmp is writable; otherwise local temp_downloads
 TEMP_DIR = Path("/tmp") if os.path.exists("/tmp") else Path("./temp_downloads")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -134,25 +135,89 @@ HTML_PAGE = """<!DOCTYPE html>
 </html>
 """
 
+def get_cookies_file() -> Optional[str]:
+    """
+    Locates or prepares cookies to bypass YouTube bot detection/sign-in challenges.
+    Supports YOUTUBE_COOKIES env var (raw Netscape string or base64) or cookies.txt file.
+    """
+    env_path = os.getenv("COOKIES_PATH") or os.getenv("YOUTUBE_COOKIES_PATH")
+    if env_path and Path(env_path).is_file():
+        return str(Path(env_path).resolve())
+
+    for candidate in [Path("cookies.txt"), TEMP_DIR / "cookies.txt"]:
+        if candidate.is_file():
+            return str(candidate.resolve())
+
+    raw_cookies = os.getenv("YOUTUBE_COOKIES")
+    if raw_cookies and raw_cookies.strip():
+        try:
+            content = raw_cookies.strip()
+            if not content.startswith("#") and " " not in content and len(content) > 50:
+                try:
+                    import base64
+                    decoded = base64.b64decode(content).decode("utf-8", errors="ignore")
+                    if "youtube.com" in decoded or "# Netscape" in decoded:
+                        content = decoded
+                except Exception:
+                    pass
+
+            target = TEMP_DIR / "cookies.txt"
+            target.write_text(content, encoding="utf-8")
+            return str(target.resolve())
+        except Exception:
+            pass
+
+    return None
+
 async def process_media(task_id: str, url: str, target_chat: str):
     tasks_status[task_id] = "Downloading media with yt-dlp..."
     out_tmpl = str(TEMP_DIR / f"{task_id}_%(title).80s.%(ext)s")
     
-    ydl_opts = {
+    base_ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': out_tmpl,
         'writethumbnail': True,
         'quiet': True,
         'no_warnings': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        },
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'mweb', 'web'],
+            }
+        }
     }
 
+    cookies_file = get_cookies_file()
+    if cookies_file:
+        base_ydl_opts['cookiefile'] = cookies_file
+
     loop = asyncio.get_event_loop()
-    def download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=True)
+
+    def download_with_fallback():
+        # First attempt with Android / MWeb clients (bypasses bot check on datacenter IPs)
+        try:
+            with yt_dlp.YoutubeDL(base_ydl_opts) as ydl:
+                return ydl.extract_info(url, download=True)
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "bot" in err_msg or "sign in" in err_msg or "requested format is not available" in err_msg:
+                # Fallback specifically to Android client with relaxed single-file format
+                fallback_opts = dict(base_ydl_opts)
+                fallback_opts['format'] = '18/best[ext=mp4]/best'
+                fallback_opts['extractor_args'] = {
+                    'youtube': {
+                        'player_client': ['android'],
+                    }
+                }
+                with yt_dlp.YoutubeDL(fallback_opts) as ydl_fb:
+                    return ydl_fb.extract_info(url, download=True)
+            raise e
 
     try:
-        info = await loop.run_in_executor(None, download)
+        info = await loop.run_in_executor(None, download_with_fallback)
         title = info.get('title', 'Archived Media')
         uploader = info.get('uploader', 'Unknown')
 
