@@ -1,6 +1,5 @@
 import os
 import re
-import glob
 import asyncio
 from pathlib import Path
 import httpx
@@ -8,69 +7,64 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9280771787:AAGKrgffYGOEmHBxR4IF9RZPjj_8D8nyDcc")
-ALLOWED_CHAT_ID = os.getenv("CHAT_ID", "-5155020880")
+BOT_TOKEN = "9280771787:AAGKrgffYGOEmHBxR4IF9RZPjj_8D8nyDcc"
+ALLOWED_CHAT_ID = "-5155020880"
 
 TEMP_DIR = Path("./temp_downloads")
 TEMP_DIR.mkdir(exist_ok=True)
 
-YOUTUBE_REGEX = r'(https?://(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+)'
+YOUTUBE_REGEX = r'(?:https?://)?(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})'
 
-# Cobalt API public instances list (auto fallback)
-COBALT_APIS = [
-    "https://api.cobalt.tools",
-    "https://cobalt-api.kwiatekm.tokyo",
-    "https://cobalt.canine.tools",
-    "https://cobalt.bowring.uk"
+# Multiple reliable open public Invidious instances
+INVIDIOUS_INSTANCES = [
+    "https://inv.tux.pizza",
+    "https://vid.puffyan.us",
+    "https://invidious.nerdvpn.de",
+    "https://invidious.projectsegfau.lt",
+    "https://invidious.drgns.space",
+    "https://yt.drgnz.club"
 ]
 
-async def download_with_cobalt(url: str, output_path: Path):
+async def download_video_stream(video_id: str, output_path: Path):
     headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
-    payload = {
-        "url": url,
-        "videoQuality": "720",
-        "youtubeVideoCodec": "h264"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    direct_url = None
-    filename = "video.mp4"
+    title = "video"
+    stream_url = None
 
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        for api_base in COBALT_APIS:
+    async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as client:
+        for instance in INVIDIOUS_INSTANCES:
             try:
-                resp = await client.post(api_base, json=payload, headers=headers)
+                api_url = f"{instance}/api/v1/videos/{video_id}"
+                resp = await client.get(api_url)
                 if resp.status_code == 200:
                     data = resp.json()
-                    status = data.get("status")
-                    if status in ("stream", "redirect", "tunnel"):
-                        direct_url = data.get("url")
-                        filename = data.get("filename", filename)
-                        break
-                    elif status == "picker":
-                        picker = data.get("picker", [])
-                        if picker:
-                            direct_url = picker[0].get("url")
+                    title = data.get("title", "YouTube Video")
+                    formats = data.get("formatStreams", [])
+                    # Pick best format (e.g. 720p or 360p with audio included)
+                    if formats:
+                        # Grab highest resolution stream
+                        best_format = formats[-1]
+                        stream_url = best_format.get("url")
+                        if stream_url:
                             break
             except Exception:
                 continue
 
-    if not direct_url:
-        raise Exception("Could not fetch download stream from Cobalt API. All instances failed or rate limited.")
+    if not stream_url:
+        raise Exception("Could not find video streams from Invidious instances.")
 
-    # Download file chunks
-    async with httpx.AsyncClient(timeout=180.0, follow_redirects=True) as dl_client:
-        async with dl_client.stream("GET", direct_url) as stream:
-            if stream.status_code >= 400:
-                raise Exception(f"Download stream error HTTP {stream.status_code}")
+    # Download stream to file
+    async with httpx.AsyncClient(timeout=180.0, headers=headers, follow_redirects=True) as dl_client:
+        async with dl_client.stream("GET", stream_url) as response:
+            if response.status_code >= 400:
+                raise Exception(f"Failed to download stream: HTTP {response.status_code}")
             with open(output_path, "wb") as f:
-                async for chunk in stream.aiter_bytes(chunk_size=1024 * 64):
+                async for chunk in response.aiter_bytes(chunk_size=1024 * 64):
                     f.write(chunk)
 
-    return filename
+    return title
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message or not update.effective_message.text:
@@ -86,15 +80,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not match:
         return
 
-    url = match.group(0)
-    status_msg = await update.effective_message.reply_text("⚡ Link received! Fetching video via Cobalt API...")
+    video_id = match.group(1)
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    status_msg = await update.effective_message.reply_text("⚡ Link received! Fetching video stream...")
 
-    task_id = f"cobalt_{int(asyncio.get_event_loop().time() * 1000)}"
+    task_id = f"inv_{int(asyncio.get_event_loop().time() * 1000)}"
     video_file = TEMP_DIR / f"{task_id}.mp4"
 
     try:
-        filename = await download_with_cobalt(url, video_file)
-        
+        title = await download_video_stream(video_id, video_file)
+
         if not video_file.exists():
             await status_msg.edit_text("❌ Download failed.")
             return
@@ -105,7 +100,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await status_msg.edit_text("📤 Uploading Video and Document to Telegram...")
-        caption = f"🎥 *{filename}*\n🔗 [Original Link]({url})"
+        caption = f"🎥 *{title}*\n🔗 [Original Link]({url})"
 
         # 1. Send as Video
         with open(video_file, "rb") as vf:
@@ -122,7 +117,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_document(
                 chat_id=chat_id,
                 document=df,
-                caption=f"📁 *Document Archive*\n{filename}",
+                caption=f"📁 *Document Archive*\n{title}",
                 parse_mode="Markdown"
             )
 
@@ -138,7 +133,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 def main():
-    print("🚀 Starting VPS Telegram Bot (Cobalt API Engine)...")
+    print("🚀 Starting VPS Telegram Bot (Invidious Direct Streams)...")
     request = HTTPXRequest(read_timeout=120.0, write_timeout=120.0, connect_timeout=60.0)
     app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
