@@ -38,18 +38,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = f"vps_{int(asyncio.get_event_loop().time() * 1000)}"
     out_tmpl = str(TEMP_DIR / f"{task_id}_%(title).80s.%(ext)s")
 
+    cookie_path = Path("cookies.txt")
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': out_tmpl,
         'writethumbnail': True,
         'quiet': True,
         'no_warnings': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios', 'web_creator'],
-            }
-        },
     }
+    if cookie_path.exists():
+        ydl_opts['cookiefile'] = str(cookie_path)
 
     loop = asyncio.get_event_loop()
     def download():
