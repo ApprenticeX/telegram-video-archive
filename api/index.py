@@ -1,5 +1,6 @@
 import os
 import glob
+import shutil
 import asyncio
 from pathlib import Path
 from typing import Optional
@@ -13,7 +14,7 @@ from telegram.request import HTTPXRequest
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "9280771787:AAGKrgffYGOEmHBxR4IF9RZPjj_8D8nyDcc")
 DEFAULT_CHAT_ID = os.environ.get("CHAT_ID", "-5155020880")
 
-# On Vercel serverless / Linux containers, /tmp is writable; otherwise local temp_downloads
+# On Vercel serverless / Linux containers, only /tmp is writable; otherwise local temp_downloads
 TEMP_DIR = Path("/tmp") if os.path.exists("/tmp") else Path("./temp_downloads")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -135,19 +136,16 @@ HTML_PAGE = """<!DOCTYPE html>
 </html>
 """
 
-def get_cookies_file() -> Optional[str]:
+def prepare_cookies_file() -> Optional[str]:
     """
-    Locates or prepares cookies to bypass YouTube bot detection/sign-in challenges.
-    Supports YOUTUBE_COOKIES env var (raw Netscape string or base64) or cookies.txt file.
+    Locates or prepares a writable cookies file in TEMP_DIR (/tmp on Vercel).
+    On Vercel, root /var/task is read-only, so any bundled cookies.txt MUST be
+    copied to TEMP_DIR so yt-dlp won't throw [Errno 30] Read-only file system
+    when attempting to update or save session cookies.
     """
-    env_path = os.getenv("COOKIES_PATH") or os.getenv("YOUTUBE_COOKIES_PATH")
-    if env_path and Path(env_path).is_file():
-        return str(Path(env_path).resolve())
+    tmp_cookies = TEMP_DIR / "cookies.txt"
 
-    for candidate in [Path("cookies.txt"), TEMP_DIR / "cookies.txt"]:
-        if candidate.is_file():
-            return str(candidate.resolve())
-
+    # 1. From environment variable (raw Netscape text or base64)
     raw_cookies = os.getenv("YOUTUBE_COOKIES")
     if raw_cookies and raw_cookies.strip():
         try:
@@ -161,13 +159,38 @@ def get_cookies_file() -> Optional[str]:
                 except Exception:
                     pass
 
-            target = TEMP_DIR / "cookies.txt"
-            target.write_text(content, encoding="utf-8")
-            return str(target.resolve())
+            tmp_cookies.write_text(content, encoding="utf-8")
+            return str(tmp_cookies.resolve())
         except Exception:
             pass
 
+    # 2. From bundled cookies.txt (e.g. /var/task/cookies.txt on Vercel or local root)
+    for candidate in [Path("cookies.txt"), Path(__file__).resolve().parent.parent / "cookies.txt"]:
+        if candidate.is_file():
+            try:
+                # Copy to writable /tmp
+                shutil.copyfile(candidate, tmp_cookies)
+                return str(tmp_cookies.resolve())
+            except Exception:
+                return str(candidate.resolve())
+
+    # 3. Check if already copied in TEMP_DIR
+    if tmp_cookies.is_file():
+        return str(tmp_cookies.resolve())
+
     return None
+
+def create_safe_ydl(ydl_opts: dict) -> yt_dlp.YoutubeDL:
+    """Creates YoutubeDL and prevents save_cookies from crashing if file is read-only."""
+    ydl = yt_dlp.YoutubeDL(ydl_opts)
+    try:
+        # Disable saving cookies back to disk in serverless read-only contexts
+        ydl.save_cookies = lambda *args, **kwargs: None
+        if hasattr(ydl, 'cookiejar') and hasattr(ydl.cookiejar, 'save'):
+            ydl.cookiejar.save = lambda *args, **kwargs: None
+    except Exception:
+        pass
+    return ydl
 
 async def process_media(task_id: str, url: str, target_chat: str):
     tasks_status[task_id] = "Downloading media with yt-dlp..."
@@ -190,21 +213,20 @@ async def process_media(task_id: str, url: str, target_chat: str):
         }
     }
 
-    cookies_file = get_cookies_file()
+    cookies_file = prepare_cookies_file()
     if cookies_file:
         base_ydl_opts['cookiefile'] = cookies_file
 
     loop = asyncio.get_event_loop()
 
     def download_with_fallback():
-        # First attempt with Android / MWeb clients (bypasses bot check on datacenter IPs)
         try:
-            with yt_dlp.YoutubeDL(base_ydl_opts) as ydl:
-                return ydl.extract_info(url, download=True)
+            ydl = create_safe_ydl(base_ydl_opts)
+            return ydl.extract_info(url, download=True)
         except Exception as e:
             err_msg = str(e).lower()
             if "bot" in err_msg or "sign in" in err_msg or "requested format is not available" in err_msg:
-                # Fallback specifically to Android client with relaxed single-file format
+                # Fallback specifically to Android client with single-stream format 18
                 fallback_opts = dict(base_ydl_opts)
                 fallback_opts['format'] = '18/best[ext=mp4]/best'
                 fallback_opts['extractor_args'] = {
@@ -212,8 +234,8 @@ async def process_media(task_id: str, url: str, target_chat: str):
                         'player_client': ['android'],
                     }
                 }
-                with yt_dlp.YoutubeDL(fallback_opts) as ydl_fb:
-                    return ydl_fb.extract_info(url, download=True)
+                ydl_fb = create_safe_ydl(fallback_opts)
+                return ydl_fb.extract_info(url, download=True)
             raise e
 
     try:
