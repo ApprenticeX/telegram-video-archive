@@ -33,7 +33,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     url = match.group(0)
-    status_msg = await update.effective_message.reply_text("⏳ Detected YouTube link! Downloading video...", quote=True)
+    status_msg = await update.effective_message.reply_text("⏳ Detected YouTube link! Downloading video...")
 
     task_id = f"vps_{int(asyncio.get_event_loop().time() * 1000)}"
     out_tmpl = str(TEMP_DIR / f"{task_id}_%(title).80s.%(ext)s")
